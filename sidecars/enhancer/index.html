@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>提示词增强器</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f8fafc; --card: #ffffff; --fg: #1e293b; --muted: #64748b;
+      --border: #e2e8f0; --accent: #4f46e5; --accent-bg: rgba(79,70,229,0.1);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #141619; --card: #1e2024; --fg: #e2e8f0; --muted: #94a3b8;
+        --border: #333740; --accent: #818cf8; --accent-bg: rgba(129,140,248,0.16);
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 16px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--fg); font-size: 13px; }
+    h2 { margin: 0 0 6px; font-size: 16px; display: flex; align-items: center; gap: 6px; }
+    p.sub { margin: 0 0 14px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+    label { display: block; font-size: 11.5px; font-weight: 600; color: var(--muted); margin-bottom: 6px; }
+    select, textarea { width: 100%; padding: 8px; border-radius: 7px; border: 1px solid var(--border); background: transparent; color: var(--fg); font: inherit; margin-bottom: 10px; }
+    textarea { min-height: 80px; resize: vertical; }
+    button.primary { width: 100%; padding: 8px 12px; border: 0; border-radius: 7px; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+    .hist-item { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 8px; font-size: 12px; }
+    .hist-meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+    .hist-text { white-space: pre-wrap; background: var(--accent-bg); padding: 6px 8px; border-radius: 6px; font-size: 11.5px; }
+  </style>
+</head>
+<body>
+  <h2>✨ 提示词增强器</h2>
+  <p class="sub">内嵌按钮已自动挂载在聊天输入框底部「模型选择」按钮右侧。您也可以在此面板直接测试或查看最近优化历史。</p>
+  <div class="card">
+    <label for="model-sel">默认优化模型</label>
+    <select id="model-sel"></select>
+    <label for="mode-sel">优化风格模式</label>
+    <select id="mode-sel"></select>
+    <label for="test-in">测试提示词</label>
+    <textarea id="test-in" placeholder="输入原始提示词进行增强测试…"></textarea>
+    <button class="primary" id="btn-run">✨ 立即优化测试</button>
+    <div id="test-out-wrap" style="display:none;margin-top:10px;">
+      <label>优化结果</label>
+      <div class="hist-text" id="test-out"></div>
+    </div>
+  </div>
+  <div class="card">
+    <label>最近优化记录</label>
+    <div id="hist-list"><span style="color:var(--muted);font-size:12px;">暂无历史记录</span></div>
+  </div>
+  <script>
+    async function loadState() {
+      const res = await fetch('/api/state').then(r => r.json());
+      const ms = document.getElementById('model-sel');
+      ms.innerHTML = (res.models || []).map(m => `<option value="${m.id}" ${m.id === res.prefs?.selectedModel ? 'selected' : ''}>${m.label}</option>`).join('');
+      const mds = document.getElementById('mode-sel');
+      mds.innerHTML = (res.modes || []).map(m => `<option value="${m.id}" ${m.id === res.prefs?.selectedMode ? 'selected' : ''}>${m.label}</option>`).join('');
+      const hist = res.prefs?.history || [];
+      if (hist.length) {
+        document.getElementById('hist-list').innerHTML = hist.slice(0, 6).map(h => `
+          <div class="hist-item">
+            <div class="hist-meta">${h.modelLabel} · ${(h.elapsedMs/1000).toFixed(1)}s</div>
+            <div class="hist-text">${h.enhanced.replace(/</g,'&lt;')}</div>
+          </div>`).join('');
+      }
+    }
+    document.getElementById('btn-run').addEventListener('click', async () => {
+      const btn = document.getElementById('btn-run');
+      const text = document.getElementById('test-in').value.trim();
+      if (!text) return;
+      btn.disabled = true; btn.textContent = '⏳ 正在优化…';
+      try {
+        const res = await fetch('/api/enhance', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ text, model: document.getElementById('model-sel').value, mode: document.getElementById('mode-sel').value })
+        }).then(r => r.json());
+        if (res.enhancedText) {
+          document.getElementById('test-out-wrap').style.display = 'block';
+          document.getElementById('test-out').textContent = res.enhancedText;
+          loadState();
+        }
+      } finally { btn.disabled = false; btn.textContent = '✨ 立即优化测试'; }
+    });
+    loadState();
+  </script>
+</body>
+</html>

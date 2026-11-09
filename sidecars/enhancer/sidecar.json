@@ -1,0 +1,20 @@
+{
+  "command": "node",
+  "args": [
+    "main.mjs"
+  ],
+  "restart_policy": "always",
+  "display_name": "提示词增强器",
+  "description": "在输入框模型选择器旁挂载一键提示词增强控件，支持切换优化所用大模型与预设模式。",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "提示词增强器",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "提示词增强器"
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" fill="none">
+  <defs>
+    <linearGradient id="pe-bg" x1="16" y1="16" x2="112" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="50%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="pe-star" x1="32" y1="28" x2="96" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#E0E7FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="14" y="14" width="100" height="100" rx="26" fill="url(#pe-bg)"/>
+  <path d="M64 28C66.5 46.5 73.5 53.5 92 56C73.5 58.5 66.5 65.5 64 84C61.5 65.5 54.5 58.5 36 56C54.5 53.5 61.5 46.5 64 28Z" fill="url(#pe-star)"/>
+  <path d="M88 74C89.2 82.5 92.5 85.8 101 87C92.5 88.2 89.2 91.5 88 100C86.8 91.5 83.5 88.2 75 87C83.5 85.8 86.8 82.5 88 74Z" fill="#FDE68A"/>
+  <path d="M41 72C41.9 78.2 44.3 80.6 50.5 81.5C44.3 82.4 41.9 84.8 41 91C40.1 84.8 37.7 82.4 31.5 81.5C37.7 80.6 40.1 78.2 41 72Z" fill="#BAE6FD"/>
+</svg>
