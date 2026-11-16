@@ -18,6 +18,8 @@ module.exports = function installPromptEnhancerWidget() {
   let undoText = null;
   let redoText = null;
   let toastTimer = null;
+  let lastPathname = location.pathname;
+  let lastEditor = null;
 
   let state = {
     models: [
@@ -548,6 +550,31 @@ module.exports = function installPromptEnhancerWidget() {
     }
   }
 
+  function clearUndoState() {
+    if (undoText === null && redoText === null) return;
+    undoText = null;
+    redoText = null;
+    renderPill();
+  }
+
+  function syncUndoState() {
+    const editor = currentComposer?.editor || null;
+    const pathChanged = location.pathname !== lastPathname;
+    const editorChanged = editor !== lastEditor;
+    if (!editor || editorChanged || pathChanged) {
+      lastEditor = editor;
+      lastPathname = location.pathname;
+      clearUndoState();
+      return;
+    }
+    if (undoText !== null && !busy) {
+      const current = readEditorText(editor).trim();
+      if (!current) {
+        clearUndoState();
+      }
+    }
+  }
+
   function runUndo() {
     if (!undoText || !currentComposer?.editor) return;
     const current = readEditorText(currentComposer.editor);
@@ -567,6 +594,7 @@ module.exports = function installPromptEnhancerWidget() {
         shadow = null;
         currentComposer = null;
       }
+      syncUndoState();
       return;
     }
     currentComposer = found;
@@ -575,6 +603,7 @@ module.exports = function installPromptEnhancerWidget() {
     }
     if (hostNode && hostNode.isConnected && hostNode.previousElementSibling === found.modelWrap) {
       hostNode.dataset.theme = detectTheme();
+      syncUndoState();
       return;
     }
     if (!hostNode) {
@@ -618,12 +647,24 @@ module.exports = function installPromptEnhancerWidget() {
       });
     }
     found.modelWrap.after(hostNode);
+    syncUndoState();
     renderPill();
   }
+
+  const scheduleUndoSync = () => {
+    setTimeout(syncUndoState, 0);
+    setTimeout(syncUndoState, 60);
+  };
 
   const onDocClick = e => {
     if (menuOpen && hostNode && !e.composedPath().includes(hostNode)) {
       togglePopover(false);
+    }
+    if (undoText !== null && currentComposer?.box && e.composedPath().includes(currentComposer.box)) {
+      const btn = e.target?.closest?.('button, [role="button"]');
+      if (btn && btn.closest?.('[data-testid="agent-input-box"]') === currentComposer.box) {
+        scheduleUndoSync();
+      }
     }
   };
   const onKeyDown = e => {
@@ -634,10 +675,19 @@ module.exports = function installPromptEnhancerWidget() {
       }
     } else if (e.key === 'Escape' && menuOpen) {
       togglePopover(false);
+    } else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && undoText !== null) {
+      if (currentComposer?.editor && e.composedPath().includes(currentComposer.editor)) {
+        scheduleUndoSync();
+      }
     }
+  };
+  const onEditorInput = () => {
+    if (undoText !== null) syncUndoState();
   };
   document.addEventListener('pointerdown', onDocClick, true);
   document.addEventListener('keydown', onKeyDown, true);
+  document.addEventListener('input', onEditorInput, true);
+  document.addEventListener('keyup', onEditorInput, true);
 
   async function syncBackendInit() {
     try {
@@ -663,6 +713,8 @@ module.exports = function installPromptEnhancerWidget() {
     obs.disconnect();
     document.removeEventListener('pointerdown', onDocClick, true);
     document.removeEventListener('keydown', onKeyDown, true);
+    document.removeEventListener('input', onEditorInput, true);
+    document.removeEventListener('keyup', onEditorInput, true);
     hostNode?.remove();
     hostNode = null;
     shadow = null;
