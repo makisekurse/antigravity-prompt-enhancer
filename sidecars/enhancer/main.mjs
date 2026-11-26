@@ -1,4 +1,4 @@
-import { readFileSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, existsSync, renameSync, rmSync } from 'node:fs';
 import { readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -8,8 +8,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { EnhancerService, ENHANCE_MODES, getAppPaths } from './enhancer-service.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const BINDING_BASE = '__agPromptEnhancerCallV1';
+const BINDING_BASE = '__agPromptEnhancerCallV2';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]']);
+const MAX_HTTP_BODY = 64 * 1024;
 
 const service = new EnhancerService();
 const paths = getAppPaths();
@@ -19,16 +20,24 @@ const ownerFile = join(paths.dataDir, 'active-sidecar.json');
 
 function claimOwnership() {
   mkdirSync(paths.dataDir, { recursive: true });
-  writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, startedAt, token: ownerToken }, null, 2), 'utf8');
+  const tmp = `${ownerFile}.${process.pid}.${ownerToken.slice(0, 8)}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ pid: process.pid, startedAt, token: ownerToken }, null, 2) + '\n', 'utf8');
+    renameSync(tmp, ownerFile);
+  } finally {
+    try { rmSync(tmp, { force: true }); } catch {}
+  }
 }
 
-function isCurrentOwner() {
+function readOwnerState() {
   try {
-    if (!existsSync(ownerFile)) return true;
+    if (!existsSync(ownerFile)) return { state: 'owned' };
     const data = JSON.parse(readFileSync(ownerFile, 'utf8'));
-    return data.token === ownerToken;
+    if (data.shutdown === true) return { state: 'shutdown' };
+    if (data.token === ownerToken) return { state: 'owned' };
+    return { state: 'superseded' };
   } catch {
-    return true;
+    return { state: 'owned' };
   }
 }
 
@@ -47,16 +56,16 @@ function rendererBridge(binding) {
   window.__agPromptEnhancerBridge?.dispose?.();
   const pending = new Map();
   let seq = 0;
-  const call = (type, input = {}) => new Promise(resolve => {
+  const call = (type, input = {}, timeoutMs = 68000) => new Promise(resolve => {
     const id = ++seq;
     const timer = setTimeout(() => {
       pending.delete(id);
       resolve({ error: '本地增强服务响应超时' });
-    }, 65000);
+    }, timeoutMs);
     pending.set(id, { resolve, timer });
     try {
       window[binding](JSON.stringify({ id, type, input }));
-    } catch (e) {
+    } catch {
       clearTimeout(timer);
       pending.delete(id);
       resolve({ error: '本地增强桥接未就绪' });
@@ -80,9 +89,12 @@ function rendererBridge(binding) {
     },
   };
   window.agPromptEnhancerHost = {
-    init: () => call('init', {}),
-    enhance: payload => call('enhance', payload),
-    savePrefs: payload => call('savePrefs', payload),
+    init: () => call('init', {}, 12000),
+    refresh: () => call('refresh', {}, 12000),
+    enhance: payload => call('enhance', payload, 70000),
+    cancel: requestKey => call('cancel', { requestKey }, 5000),
+    savePrefs: payload => call('savePrefs', payload, 10000),
+    clearHistory: () => call('clearHistory', {}, 10000),
   };
 }
 
@@ -110,7 +122,10 @@ function httpGetJson(port, path) {
     const req = httpRequest({ hostname: '127.0.0.1', port, path, method: 'GET' }, res => {
       let body = '';
       res.setEncoding('utf8');
-      res.on('data', c => { body += c; });
+      res.on('data', c => {
+        body += c;
+        if (body.length > 2 * 1024 * 1024) req.destroy(new Error('Response too large'));
+      });
       res.on('end', () => {
         try {
           if (res.statusCode !== 200) throw new Error(`HTTP ${res.statusCode}`);
@@ -147,12 +162,14 @@ class CdpSession {
     this.pending = new Map();
     this.nextId = 0;
     this.closed = false;
+    this.scriptId = null;
   }
   async open() {
     this.ws = new globalThis.WebSocket(this.url);
     this.ws.addEventListener('message', ev => {
       try {
-        const msg = JSON.parse(String(ev.data));
+        if (typeof ev.data !== 'string' || ev.data.length > 2 * 1024 * 1024) return;
+        const msg = JSON.parse(ev.data);
         if (msg.id) {
           const item = this.pending.get(msg.id);
           if (!item) return;
@@ -202,31 +219,42 @@ class RuntimeInjector {
     this.source = buildInjectedSource(this.binding);
     this.sessions = new Map();
     this.busy = false;
+    this.stopping = false;
   }
 
   async handleEvent(session, msg) {
-    if (!isCurrentOwner()) return;
+    if (this.stopping || readOwnerState().state !== 'owned') return;
     const p = msg.params || {};
     if (msg.method === 'Runtime.bindingCalled' && p.name === this.binding) {
+      if (typeof p.payload !== 'string' || p.payload.length > 512 * 1024) return;
       let req;
       try { req = JSON.parse(p.payload); } catch { return; }
-      if (!req?.id) return;
+      if (!Number.isSafeInteger(req?.id) || req.id < 1) return;
       let result = {};
       try {
-        if (req.type === 'init') {
+        if (req.type === 'init' || req.type === 'refresh') {
           result = {
-            models: await service.getAvailableModels(),
+            models: await service.getAvailableModels(req.type === 'refresh'),
             modes: ENHANCE_MODES,
             prefs: await service.loadPreferences(),
           };
         } else if (req.type === 'enhance') {
-          result = await service.enhancePrompt(req.input || {});
+          const payload = req.input || {};
+          result = await service.enhancePrompt({
+            ...payload,
+            requestKey: payload.requestKey || `${session.url}:${req.id}`,
+          });
+        } else if (req.type === 'cancel') {
+          result = { cancelled: service.cancelEnhance(req.input?.requestKey) };
         } else if (req.type === 'savePrefs') {
           result = await service.savePreferences(req.input || {});
+        } else if (req.type === 'clearHistory') {
+          result = await service.clearHistory();
         }
       } catch (e) {
-        result = { error: e.message || '执行异常' };
+        result = e.aborted ? { aborted: true } : { error: e.message || '执行异常' };
       }
+      if (this.stopping || readOwnerState().state !== 'owned') return;
       const expr = `window.__agPromptEnhancerBridge?.resolve(${Number(req.id)}, ${JSON.stringify(result)})`;
       try {
         await session.command('Runtime.evaluate', {
@@ -242,28 +270,57 @@ class RuntimeInjector {
     const origin = new URL(target.url).origin;
     const session = new CdpSession(wsUrl, m => void this.handleEvent(session, m), () => this.sessions.delete(wsUrl));
     session.origin = origin;
-    await session.open();
-    await session.command('Page.enable');
-    await session.command('Runtime.enable');
-    await session.command('Runtime.addBinding', { name: this.binding });
-    const guarded = `if (location.origin === ${JSON.stringify(origin)}) {\n${this.source}\n}`;
-    session.guarded = guarded;
-    await session.command('Page.addScriptToEvaluateOnNewDocument', { source: guarded });
-    await session.command('Runtime.evaluate', { expression: guarded });
-    return session;
+    try {
+      await session.open();
+      await session.command('Page.enable');
+      await session.command('Runtime.enable');
+      await session.command('Runtime.addBinding', { name: this.binding });
+      const guarded = `if (location.origin === ${JSON.stringify(origin)}) {\n${this.source}\n}`;
+      session.guarded = guarded;
+      const added = await session.command('Page.addScriptToEvaluateOnNewDocument', { source: guarded });
+      session.scriptId = added?.identifier || null;
+      await session.command('Runtime.evaluate', { expression: guarded });
+      return session;
+    } catch (err) {
+      await this.cleanupSession(session, false);
+      throw err;
+    }
+  }
+
+  async cleanupSession(session, disposePage = true) {
+    try {
+      if (session.scriptId) {
+        await session.command('Page.removeScriptToEvaluateOnNewDocument', { identifier: session.scriptId });
+        session.scriptId = null;
+      }
+    } catch {}
+    try { await session.command('Runtime.removeBinding', { name: this.binding }); } catch {}
+    if (disposePage) {
+      try {
+        await session.command('Runtime.evaluate', {
+          expression: `if (window.__agPromptEnhancerOwner === ${JSON.stringify(ownerToken)}) { window.__agPromptEnhancerDispose?.(); window.__agPromptEnhancerBridge?.dispose?.(); delete window.agPromptEnhancerHost; }`,
+        });
+      } catch {}
+    }
+    session.close();
   }
 
   async tick() {
-    if (this.busy) return;
+    if (this.busy || this.stopping) return;
     this.busy = true;
     try {
-      if (!isCurrentOwner()) {
-        for (const s of this.sessions.values()) s.close();
-        this.sessions.clear();
+      const ownerState = readOwnerState().state;
+      if (ownerState === 'shutdown') {
+        await this.detachAll(true);
+        process.exit(0);
+      }
+      if (ownerState === 'superseded') {
+        // Newer sidecar owns the page: only remove our own preloads/bindings, never dispose the newer widget!
+        await this.detachAll(false);
         process.exit(0);
       }
       if (!isPluginEnabled()) {
-        await this.detachAll();
+        await this.detachAll(true);
         return;
       }
       const targets = await discoverCdpTargets();
@@ -289,17 +346,21 @@ class RuntimeInjector {
     }
   }
 
-  async detachAll() {
-    for (const s of this.sessions.values()) {
-      try { await s.command('Runtime.evaluate', { expression: 'window.__agPromptEnhancerDispose?.();window.__agPromptEnhancerBridge?.dispose?.();' }); } catch {}
-      s.close();
-    }
+  async detachAll(disposePage = true) {
+    const list = [...this.sessions.values()];
     this.sessions.clear();
+    await Promise.allSettled(list.map(s => this.cleanupSession(s, disposePage)));
   }
 
   start() {
     void this.tick();
     this.timer = setInterval(() => void this.tick(), 2500);
+  }
+
+  async stop(disposePage = false) {
+    this.stopping = true;
+    clearInterval(this.timer);
+    await this.detachAll(disposePage);
   }
 }
 
@@ -313,7 +374,12 @@ async function loadSidecarSdk() {
   if (existsSync(exe)) {
     const sdkDir = join(paths.dataDir, 'sdk');
     const sdkFile = join(sdkDir, 'index.mjs');
-    if (!existsSync(sdkFile)) {
+    const verFile = join(sdkDir, 'version.txt');
+    const info = await stat(exe);
+    const stamp = `${info.size}:${info.mtimeMs}`;
+    let cached = false;
+    try { cached = (await readFile(verFile, 'utf8')).trim() === stamp && existsSync(sdkFile); } catch {}
+    if (!cached) {
       const bin = await readFile(exe);
       const marker = bin.indexOf('export class SidecarApp');
       const start = bin.lastIndexOf("import { execFileSync } from 'node:child_process';", marker);
@@ -322,6 +388,7 @@ async function loadSidecarSdk() {
       if (marker > 0 && start >= 0 && tailIdx > marker) {
         await mkdir(sdkDir, { recursive: true });
         await writeFile(sdkFile, bin.subarray(start, tailIdx + Buffer.byteLength(tail)).toString('utf8'));
+        await writeFile(verFile, stamp, 'utf8');
       }
     }
     if (existsSync(sdkFile)) return await import(pathToFileURL(sdkFile).href);
@@ -329,9 +396,33 @@ async function loadSidecarSdk() {
   return null;
 }
 
+async function readJsonBody(req, limit = MAX_HTTP_BODY) {
+  let body = '';
+  for await (const chunk of req) {
+    body += chunk;
+    if (Buffer.byteLength(body, 'utf8') > limit) {
+      throw Object.assign(new Error('请求体过大'), { status: 413 });
+    }
+  }
+  return body.trim() ? JSON.parse(body) : {};
+}
+
 claimOwnership();
 const injector = new RuntimeInjector();
 injector.start();
+
+let httpServer = null;
+const gracefulExit = async () => {
+  const forceTimer = setTimeout(() => process.exit(0), 2000);
+  forceTimer.unref?.();
+  try { httpServer?.close?.(); } catch {}
+  const ownerState = readOwnerState().state;
+  await injector.stop(ownerState === 'owned' || ownerState === 'shutdown');
+  process.exit(0);
+};
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.once(sig, () => { void gracefulExit(); });
+}
 
 if (process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
   const sdk = await loadSidecarSdk();
@@ -344,28 +435,59 @@ if (process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
       modes: ENHANCE_MODES,
       prefs: await service.loadPreferences(),
     }), 'GET');
-    app.api('/api/enhance', async data => service.enhancePrompt(data || {}), 'POST');
+    app.api('/api/prefs', async data => service.savePreferences(data || {}), 'POST');
+    app.api('/api/history/clear', async () => service.clearHistory(), 'POST');
+    app.api('/api/enhance', async data => {
+      try { return await service.enhancePrompt(data || {}); }
+      catch (e) { return new Response(JSON.stringify({ error: e.message || '执行异常' }), { status: 400, contentType: 'application/json' }); }
+    }, 'POST');
     app.run();
   }
 } else {
   const port = Number(process.env.AG_PE_PORT || 17895);
-  const srv = createServer(async (req, res) => {
-    const url = new URL(req.url, 'http://127.0.0.1');
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  httpServer = createServer(async (req, res) => {
+    const host = req.headers.host || '';
+    if (!/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(host)) {
+      res.writeHead(403); res.end(); return;
+    }
+    const origin = req.headers.origin;
+    if (origin && origin !== `http://${host}`) {
+      res.writeHead(403); res.end(); return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const url = new URL(req.url, `http://${host}`);
+
     if (url.pathname === '/api/state' && req.method === 'GET') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify({ models: await service.getAvailableModels(), modes: ENHANCE_MODES, prefs: await service.loadPreferences() }));
       return;
     }
-    if (url.pathname === '/api/enhance' && req.method === 'POST') {
-      let body = '';
-      for await (const c of req) body += c;
-      try { res.end(JSON.stringify(await service.enhancePrompt(JSON.parse(body || '{}')))); }
-      catch (e) { res.statusCode = 400; res.end(JSON.stringify({ error: e.message })); }
+    if (url.pathname === '/api/prefs' && req.method === 'POST') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      try { res.end(JSON.stringify(await service.savePreferences(await readJsonBody(req)))); }
+      catch (e) { res.statusCode = e.status || 400; res.end(JSON.stringify({ error: e.message })); }
       return;
     }
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.end(readFileSync(join(HERE, 'index.html'), 'utf8'));
+    if (url.pathname === '/api/history/clear' && req.method === 'POST') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      try { res.end(JSON.stringify(await service.clearHistory())); }
+      catch (e) { res.statusCode = 500; res.end(JSON.stringify({ error: e.message })); }
+      return;
+    }
+    if (url.pathname === '/api/enhance' && req.method === 'POST') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      try { res.end(JSON.stringify(await service.enhancePrompt(await readJsonBody(req)))); }
+      catch (e) { res.statusCode = e.status || 400; res.end(JSON.stringify({ error: e.message })); }
+      return;
+    }
+    if (url.pathname === '/' && req.method === 'GET') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.end(readFileSync(join(HERE, 'index.html'), 'utf8'));
+      return;
+    }
+    res.writeHead(404); res.end();
   });
-  srv.on('error', () => {});
-  srv.listen(port, '127.0.0.1');
+  httpServer.on('error', () => {});
+  httpServer.listen(port, '127.0.0.1');
 }

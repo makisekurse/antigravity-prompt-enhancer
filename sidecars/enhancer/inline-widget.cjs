@@ -9,34 +9,32 @@ module.exports = function installPromptEnhancerWidget() {
   window.__agPromptEnhancerInstalled = true;
 
   const HOST_ID = 'ag-prompt-enhancer-host';
+  const MAX_HISTORY_STACK = 5;
   let hostNode = null;
   let shadow = null;
   let currentComposer = null;
   let menuOpen = false;
   let busy = false;
   let activeReqId = 0;
-  let undoText = null;
-  let redoText = null;
+  let activeReqKey = null;
+  let undoStack = [];
+  let redoStack = [];
   let toastTimer = null;
+  let saveCustomTimer = null;
+  let mountRaf = null;
+  let isPluginMutating = false;
   let lastPathname = location.pathname;
   let lastEditor = null;
+  let unregisterLexListener = null;
+  let resizeObserver = null;
 
   let state = {
     models: [
       { id: '__follow_current__', label: '🔄 跟随当前对话模型', shortLabel: '跟随当前' },
       { id: 'MODEL_PLACEHOLDER_M320', label: '⚡ Gemini 3.8 Flash (Low · 极速推荐)', shortLabel: 'Flash 3.8 低' },
-      { id: 'MODEL_PLACEHOLDER_M319', label: '⚡ Gemini 3.8 Flash (Medium)', shortLabel: 'Flash 3.8 中' },
-      { id: 'MODEL_PLACEHOLDER_M318', label: '⚡ Gemini 3.8 Flash (High)', shortLabel: 'Flash 3.8 高' },
-      { id: 'MODEL_PLACEHOLDER_M419', label: '🧠 Gemini 4 Argon (Low)', shortLabel: 'Argon 4 低' },
-      { id: 'MODEL_PLACEHOLDER_M418', label: '🧠 Gemini 4 Argon (Medium)', shortLabel: 'Argon 4 中' },
-      { id: 'MODEL_PLACEHOLDER_M417', label: '🧠 Gemini 4 Argon (High)', shortLabel: 'Argon 4 高' },
-      { id: 'MODEL_PLACEHOLDER_M403', label: '🎭 Claude Sonnet 5.5 (Low)', shortLabel: 'Sonnet 5.5 低' },
-      { id: 'MODEL_PLACEHOLDER_M404', label: '🎭 Claude Sonnet 5.5 (Medium)', shortLabel: 'Sonnet 5.5 中' },
-      { id: 'MODEL_PLACEHOLDER_M405', label: '🎭 Claude Sonnet 5.5 (High)', shortLabel: 'Sonnet 5.5 高' },
-      { id: 'MODEL_PLACEHOLDER_M400', label: '🏛️ Claude Opus 5.5 (Low)', shortLabel: 'Opus 5.5 低' },
-      { id: 'MODEL_PLACEHOLDER_M401', label: '🏛️ Claude Opus 5.5 (Medium)', shortLabel: 'Opus 5.5 中' },
-      { id: 'MODEL_PLACEHOLDER_M402', label: '🏛️ Claude Opus 5.5 (High)', shortLabel: 'Opus 5.5 高' },
-      { id: 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM', label: '🌐 GPT-OSS 120B (Medium)', shortLabel: 'GPT-120B' },
+      { id: 'MODEL_PLACEHOLDER_M534', label: '✨ Gemini 4 Neon (Low)', shortLabel: 'Neon 4 低' },
+      { id: 'MODEL_PLACEHOLDER_M532', label: '✨ Gemini 4 Neon (High)', shortLabel: 'Neon 4 高' },
+      { id: 'MODEL_PLACEHOLDER_M535', label: '✨ Gemini 4 Neon (XHigh)', shortLabel: 'Neon 4 超高' },
     ],
     modes: [
       { id: 'general', label: '🎯 通用增强', desc: '补全目标背景、关键细节、执行步骤与交付标准' },
@@ -54,12 +52,17 @@ module.exports = function installPromptEnhancerWidget() {
     const check = el => {
       if (!el) return null;
       const bg = getComputedStyle(el).backgroundColor;
-      const m = bg && bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      const m = bg && bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
       if (!m) return null;
+      if (m[4] !== undefined && Number(m[4]) < 0.1) return null;
       const lum = 0.2126 * Number(m[1]) + 0.7152 * Number(m[2]) + 0.0722 * Number(m[3]);
       return lum >= 145 ? 'light' : 'dark';
     };
-    return check(currentComposer?.box) || check(document.body) || check(document.documentElement) || 'light';
+    for (let el = currentComposer?.box; el; el = el.parentElement) {
+      const hit = check(el);
+      if (hit) return hit;
+    }
+    return check(document.body) || check(document.documentElement) || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
   }
 
   function readEditorText(editor) {
@@ -78,8 +81,57 @@ module.exports = function installPromptEnhancerWidget() {
     return editor.innerText || editor.textContent || '';
   }
 
-  function writeEditorText(editor, newText) {
+  function extractComposerPayload(editor) {
+    const fallback = { text: readEditorText(editor), mentions: [], editorState: null };
+    const lex = editor?.__lexicalEditor;
+    if (!lex) return fallback;
+    try {
+      const editorState = lex.getEditorState();
+      const mentions = [];
+      const lines = [];
+      editorState.read(() => {
+        const root = lex._editorState._nodeMap.get('root');
+        if (!root || typeof root.getChildren !== 'function') return;
+        const collectInline = node => {
+          const type = typeof node.getType === 'function' ? node.getType() : '';
+          if (type === 'text') return node.getTextContent();
+          if (type === 'linebreak') return '\n';
+          if (type === 'tab') return '\t';
+          if (typeof node.getChildren === 'function' && (type === 'paragraph' || type === 'root')) {
+            return node.getChildren().map(collectInline).join('');
+          }
+          // Preserve special mention/context chips (e.g. contextScopeItemMention / beautifulMention)
+          const idx = mentions.length;
+          const json = typeof node.exportJSON === 'function' ? node.exportJSON() : null;
+          mentions.push({ type, text: node.getTextContent(), json });
+          return `{{MENTION_${idx}}}`;
+        };
+        for (const child of root.getChildren()) {
+          lines.push(collectInline(child));
+        }
+      });
+      const text = lines.length ? lines.join('\n') : readEditorText(editor);
+      return { text, mentions, editorState };
+    } catch {
+      return fallback;
+    }
+  }
+
+  function recreateMentionNode(lex, mention) {
+    if (!mention) return null;
+    try {
+      const klass = lex._nodes?.get(mention.type)?.klass;
+      if (klass && typeof klass.importJSON === 'function' && mention.json) {
+        return klass.importJSON(mention.json);
+      }
+    } catch {}
+    const Text = lex._nodes?.get('text')?.klass;
+    return Text ? new Text(mention.text || '') : null;
+  }
+
+  function writeEditorText(editor, newText, mentions = []) {
     if (!editor) return false;
+    isPluginMutating = true;
     try {
       const lex = editor.__lexicalEditor;
       if (lex) {
@@ -90,14 +142,57 @@ module.exports = function installPromptEnhancerWidget() {
           const Text = lex._nodes.get('text')?.klass;
           if (root && Para && Text) {
             root.clear();
+            const used = new Set();
             const lines = String(newText).split(/\r?\n/);
-            let lastP = null;
+            const paragraphs = [];
             for (const line of lines) {
               const p = new Para();
-              if (line.length > 0) p.append(new Text(line));
-              root.append(p);
-              lastP = p;
+              if (mentions.length > 0 && /\{\{MENTION_\d+\}\}/.test(line)) {
+                const parts = line.split(/(\{\{MENTION_\d+\}\})/g);
+                for (const part of parts) {
+                  if (!part) continue;
+                  const mm = part.match(/^\{\{MENTION_(\d+)\}\}$/);
+                  if (mm) {
+                    const idx = Number(mm[1]);
+                    const m = mentions[idx];
+                    if (m) {
+                      const restored = recreateMentionNode(lex, m);
+                      if (restored) {
+                        p.append(restored);
+                        used.add(idx);
+                        continue;
+                      }
+                    }
+                  }
+                  p.append(new Text(part));
+                }
+              } else if (line.length > 0) {
+                p.append(new Text(line));
+              }
+              paragraphs.push(p);
             }
+            // Safeguard: if the model accidentally dropped any mention placeholder, prepend them safely
+            const missing = mentions.map((m, idx) => (used.has(idx) ? null : m)).filter(Boolean);
+            if (missing.length > 0) {
+              const firstP = paragraphs[0] || new Para();
+              if (!paragraphs.length) paragraphs.push(firstP);
+              const firstChild = typeof firstP.getFirstChild === 'function' ? firstP.getFirstChild() : null;
+              const prefixNodes = [];
+              for (const m of missing) {
+                const restored = recreateMentionNode(lex, m);
+                if (restored) {
+                  prefixNodes.push(restored);
+                  prefixNodes.push(new Text(' '));
+                }
+              }
+              if (firstChild && typeof firstChild.insertBefore === 'function') {
+                for (const n of prefixNodes) firstChild.insertBefore(n);
+              } else {
+                for (const n of prefixNodes) firstP.append(n);
+              }
+            }
+            for (const p of paragraphs) root.append(p);
+            const lastP = paragraphs[paragraphs.length - 1];
             if (lastP && typeof lastP.selectEnd === 'function') lastP.selectEnd();
             ok = true;
           }
@@ -107,11 +202,31 @@ module.exports = function installPromptEnhancerWidget() {
           return true;
         }
       }
-    } catch {}
-    editor.focus();
-    document.execCommand('selectAll', false, null);
-    document.execCommand('insertText', false, newText);
-    return true;
+      editor.focus();
+      document.execCommand('selectAll', false, null);
+      document.execCommand('insertText', false, newText);
+      return true;
+    } finally {
+      setTimeout(() => { isPluginMutating = false; }, 0);
+    }
+  }
+
+  function restoreSnapshot(editor, snapshot) {
+    if (!editor || !snapshot) return false;
+    isPluginMutating = true;
+    try {
+      const lex = editor.__lexicalEditor;
+      if (lex && snapshot.editorState && typeof lex.setEditorState === 'function') {
+        lex.setEditorState(snapshot.editorState);
+        editor.focus();
+        return true;
+      }
+      return writeEditorText(editor, snapshot.text || '', snapshot.mentions || []);
+    } catch {
+      return writeEditorText(editor, snapshot.text || '', snapshot.mentions || []);
+    } finally {
+      setTimeout(() => { isPluginMutating = false; }, 0);
+    }
   }
 
   function findTargetComposer() {
@@ -127,7 +242,7 @@ module.exports = function installPromptEnhancerWidget() {
       while (branch.parentElement && branch.parentElement !== footer) {
         branch = branch.parentElement;
       }
-      let modelWrap = modelBtn.closest('.no-focus-agent-input')?.parentElement || modelBtn.parentElement;
+      const modelWrap = modelBtn.closest('.no-focus-agent-input')?.parentElement || modelBtn.parentElement;
       return { box, editor, modelBtn, footer, branch, modelWrap };
     }
     return null;
@@ -135,8 +250,9 @@ module.exports = function installPromptEnhancerWidget() {
 
   const SPARKLE_SVG = `<svg class="icon-sparkle" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M7.5 2C7.8 5.1 9.1 6.4 12.2 6.7C9.1 7 7.8 8.3 7.5 11.4C7.2 8.3 5.9 7 2.8 6.7C5.9 6.4 7.2 5.1 7.5 2Z" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M12.3 10.2V13.4M10.7 11.8H13.9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`;
   const SPINNER_SVG = `<svg class="icon-spin" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-opacity="0.25" stroke-width="1.5"/><path d="M13.5 8a5.5 5.5 0 0 0-5.5-5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
-  const CARET_SVG = `<svg class="icon-caret" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true"><path d="M480-541.85l-184,184L253.85-400L480-626.15L706.15-400L664-357.85l-184-184Z"></path></svg>`;
+  const CARET_SVG = `<svg class="icon-caret" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true"><path d="M480-344 240-584l56-56 184 184 184-184 56 56-240 240Z"></path></svg>`;
   const UNDO_SVG = `<svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6.5H10C11.933 6.5 13.5 8.067 13.5 10C13.5 11.933 11.933 13.5 10 13.5H6M4 6.5L6.8 3.7M4 6.5L6.8 9.3" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  const REDO_SVG = `<svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M12 6.5H6C4.067 6.5 2.5 8.067 2.5 10C2.5 11.933 4.067 13.5 6 13.5H10M12 6.5L9.2 3.7M12 6.5L9.2 9.3" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
   const WIDGET_CSS = `
     :host {
@@ -219,23 +335,30 @@ module.exports = function installPromptEnhancerWidget() {
     .btn-model .model-sub {
       opacity: 0.72;
     }
+    :host([data-density="compact"]) .btn-model .model-sub {
+      display: none;
+    }
+    :host([data-density="minimal"]) .btn-model .model-sub,
+    :host([data-density="minimal"]) .btn-enhance .enh-label,
+    :host([data-density="minimal"]) .btn-undo .undo-label {
+      display: none;
+    }
     .sep-dot {
       width: 1px;
       height: 12px;
       background: var(--pe-sep);
       flex: none;
     }
-    .btn-undo {
+    .btn-undo, .btn-redo {
       height: 28px;
       margin-left: 1px;
       padding: 0 6px;
       border-radius: 9999px;
       opacity: 0.8;
     }
-    .btn-undo:hover {
-      opacity: 1;
-    }
-    .btn-undo[hidden] { display: none; }
+    .btn-redo { padding: 0 5px; }
+    .btn-undo:hover, .btn-redo:hover { opacity: 1; }
+    .btn-undo[hidden], .btn-redo[hidden] { display: none; }
     svg { flex: none; }
     .icon-spin { animation: pe-spin 0.85s linear infinite; }
     @keyframes pe-spin { to { transform: rotate(360deg); } }
@@ -261,7 +384,7 @@ module.exports = function installPromptEnhancerWidget() {
       inset: auto;
       margin: 0;
       z-index: 2147483645;
-      width: 288px;
+      width: 296px;
       padding: 10px;
       border-radius: 12px;
       background: var(--pe-card);
@@ -298,6 +421,9 @@ module.exports = function installPromptEnhancerWidget() {
       justify-content: flex-start;
       height: auto;
     }
+    .mode-item:last-child:nth-child(odd) {
+      grid-column: 1 / -1;
+    }
     .mode-item:hover { background: var(--pe-item-hover); }
     .mode-item[aria-checked="true"] {
       background: var(--pe-item-active);
@@ -321,7 +447,7 @@ module.exports = function installPromptEnhancerWidget() {
       outline: none;
     }
     .model-list {
-      max-height: 190px;
+      max-height: 205px;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
@@ -362,6 +488,13 @@ module.exports = function installPromptEnhancerWidget() {
     return found ? found.shortLabel : 'Flash 3.8 低';
   }
 
+  function updateDensity() {
+    if (!hostNode || !currentComposer?.footer) return;
+    const w = currentComposer.footer.clientWidth || 800;
+    const density = w < 460 ? 'minimal' : w < 640 ? 'compact' : 'full';
+    if (hostNode.dataset.density !== density) hostNode.dataset.density = density;
+  }
+
   function showToast(msg, duration = 2600) {
     if (!shadow) return;
     const toast = shadow.getElementById('pe-toast');
@@ -371,7 +504,7 @@ module.exports = function installPromptEnhancerWidget() {
     toast.textContent = msg;
     toast.hidden = false;
     const rect = btn.getBoundingClientRect();
-    toast.style.left = `${Math.max(12, Math.min(window.innerWidth - 260, rect.left))}px`;
+    toast.style.left = `${Math.max(12, Math.min(window.innerWidth - 280, rect.left))}px`;
     toast.style.top = `${Math.max(12, rect.top - 36)}px`;
     toastTimer = setTimeout(() => { toast.hidden = true; }, duration);
   }
@@ -382,7 +515,7 @@ module.exports = function installPromptEnhancerWidget() {
     const trigger = shadow.getElementById('pe-btn-model');
     if (!card || !trigger) return;
     const rect = trigger.getBoundingClientRect();
-    const width = 300;
+    const width = card.offsetWidth || 296;
     const left = Math.max(12, Math.min(window.innerWidth - width - 12, rect.left - 40));
     card.style.left = `${left}px`;
     const cardHeight = card.offsetHeight || 340;
@@ -390,6 +523,24 @@ module.exports = function installPromptEnhancerWidget() {
     card.style.top = useAbove
       ? `${Math.max(12, rect.top - cardHeight - 8)}px`
       : `${Math.min(window.innerHeight - cardHeight - 12, rect.bottom + 8)}px`;
+  }
+
+  function applyBackendState(init) {
+    if (!init) return;
+    if (Array.isArray(init.models) && init.models.length) state.models = init.models;
+    if (Array.isArray(init.modes) && init.modes.length) {
+      state.modes = init.modes.map(m => ({ id: m.id, label: m.label, desc: m.desc }));
+    }
+    if (init.prefs) {
+      if (init.prefs.selectedModel) state.selectedModel = init.prefs.selectedModel;
+      if (init.prefs.selectedMode) state.selectedMode = init.prefs.selectedMode;
+      if (typeof init.prefs.customSystemPrompt === 'string') state.customSystemPrompt = init.prefs.customSystemPrompt;
+    }
+    renderPill();
+    if (menuOpen) {
+      renderPopoverContent();
+      positionPopover();
+    }
   }
 
   function togglePopover(force) {
@@ -404,6 +555,8 @@ module.exports = function installPromptEnhancerWidget() {
         try { card.showPopover(); } catch {}
       }
       positionPopover();
+      // Refresh latest models & sidebar prefs silently on open
+      window.agPromptEnhancerHost?.refresh?.().then(applyBackendState).catch(() => {});
     } else {
       if (typeof card.hidePopover === 'function' && card.matches(':popover-open')) {
         try { card.hidePopover(); } catch {}
@@ -426,26 +579,41 @@ module.exports = function installPromptEnhancerWidget() {
   }
 
   function renderPill() {
-    if (!shadow) return;
+    if (!shadow || !hostNode) return;
     hostNode.dataset.theme = detectTheme();
+    updateDensity();
     const btnEnhance = shadow.getElementById('pe-btn-enhance');
     const btnModel = shadow.getElementById('pe-btn-model');
     const btnUndo = shadow.getElementById('pe-btn-undo');
+    const btnRedo = shadow.getElementById('pe-btn-redo');
+    const shortLabel = currentModelShortLabel();
+
     if (btnEnhance) {
-      btnEnhance.innerHTML = busy
-        ? `${SPINNER_SVG}<span>优化中…</span>`
-        : `${SPARKLE_SVG}<span>增强</span>`;
+      btnEnhance.innerHTML = busy ? SPINNER_SVG : SPARKLE_SVG;
+      const lbl = document.createElement('span');
+      lbl.className = 'enh-label';
+      lbl.textContent = busy ? '优化中…' : '增强';
+      btnEnhance.append(lbl);
       btnEnhance.title = busy
-        ? '正在调用大模型优化提示词，点击可取消'
-        : `使用 [${currentModelShortLabel()}] 一键优化输入框中的提示词 (Alt+E)`;
+        ? '正在调用大模型优化提示词，点击立即中止请求'
+        : `使用 [${shortLabel}] 一键优化输入框中的提示词 (Alt+E)`;
     }
     if (btnModel) {
-      btnModel.innerHTML = `<span class="model-sub">${currentModelShortLabel()}</span>${CARET_SVG}`;
-      btnModel.title = '选择提示词优化所用的大模型与增强风格';
+      btnModel.innerHTML = '';
+      const sub = document.createElement('span');
+      sub.className = 'model-sub';
+      sub.textContent = shortLabel;
+      btnModel.append(sub);
+      btnModel.insertAdjacentHTML('beforeend', CARET_SVG);
+      btnModel.title = `当前优化模型：${shortLabel}（点击切换模型与风格）`;
     }
     if (btnUndo) {
-      btnUndo.hidden = !undoText || busy;
-      btnUndo.title = '还原为优化前的原始提示词';
+      btnUndo.hidden = undoStack.length === 0 || busy;
+      btnUndo.title = `还原为优化前的提示词（可撤回 ${undoStack.length} 步）`;
+    }
+    if (btnRedo) {
+      btnRedo.hidden = redoStack.length === 0 || busy;
+      btnRedo.title = '重新应用刚才撤销的增强结果';
     }
   }
 
@@ -455,13 +623,14 @@ module.exports = function installPromptEnhancerWidget() {
     const customBox = shadow.getElementById('pe-custom-box');
     const customInput = shadow.getElementById('pe-custom-input');
     const modelList = shadow.getElementById('pe-model-list');
+
     if (modeGrid) {
       modeGrid.replaceChildren(...state.modes.map(m => {
         const b = document.createElement('button');
         b.type = 'button';
         b.className = 'mode-item';
         b.textContent = m.label;
-        b.title = m.desc;
+        b.title = m.desc || '';
         b.setAttribute('aria-checked', String(m.id === state.selectedMode));
         b.addEventListener('click', () => {
           state.selectedMode = m.id;
@@ -474,7 +643,7 @@ module.exports = function installPromptEnhancerWidget() {
     }
     if (customBox && customInput) {
       customBox.hidden = state.selectedMode !== 'custom';
-      if (customInput.value !== state.customSystemPrompt) {
+      if (shadow.activeElement !== customInput && customInput.value !== state.customSystemPrompt) {
         customInput.value = state.customSystemPrompt;
       }
     }
@@ -485,7 +654,11 @@ module.exports = function installPromptEnhancerWidget() {
         b.className = 'model-opt';
         const active = m.id === state.selectedModel;
         b.setAttribute('aria-selected', String(active));
-        b.innerHTML = `<span>${m.label}</span><span>${active ? '✓' : ''}</span>`;
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = m.label;
+        const tickSpan = document.createElement('span');
+        tickSpan.textContent = active ? '✓' : '';
+        b.append(nameSpan, tickSpan);
         b.addEventListener('click', () => {
           state.selectedModel = m.id;
           saveLocalState();
@@ -501,13 +674,17 @@ module.exports = function installPromptEnhancerWidget() {
   async function runEnhance() {
     if (!currentComposer?.editor) return;
     if (busy) {
+      const cancelKey = activeReqKey;
       activeReqId++;
+      activeReqKey = null;
       busy = false;
       renderPill();
-      showToast('已取消提示词优化');
+      if (cancelKey) void window.agPromptEnhancerHost?.cancel?.(cancelKey);
+      showToast('⏹ 已中止本次提示词优化');
       return;
     }
-    const rawText = readEditorText(currentComposer.editor).trim();
+    const payload = extractComposerPayload(currentComposer.editor);
+    const rawText = payload.text.trim();
     if (!rawText) {
       showToast('💡 请先在输入框中输入需要优化的提示词');
       currentComposer.editor.focus();
@@ -516,6 +693,8 @@ module.exports = function installPromptEnhancerWidget() {
     togglePopover(false);
     busy = true;
     const reqId = ++activeReqId;
+    const reqKey = `req_${Date.now()}_${reqId}`;
+    activeReqKey = reqKey;
     renderPill();
 
     const hostModelText = currentComposer.modelBtn?.getAttribute('aria-label') || currentComposer.modelBtn?.textContent || '';
@@ -526,18 +705,26 @@ module.exports = function installPromptEnhancerWidget() {
         hostModelText,
         mode: state.selectedMode,
         customSystemPrompt: state.customSystemPrompt,
+        hasMentions: payload.mentions.length > 0,
+        requestKey: reqKey,
       });
       if (reqId !== activeReqId) return;
       busy = false;
+      activeReqKey = null;
+      if (res?.aborted) {
+        renderPill();
+        return;
+      }
       if (res?.error) {
         renderPill();
         showToast(`⚠️ ${res.error}`, 3500);
         return;
       }
       if (res?.enhancedText) {
-        undoText = rawText;
-        redoText = res.enhancedText;
-        writeEditorText(currentComposer.editor, res.enhancedText);
+        undoStack.push({ editorState: payload.editorState, text: rawText, mentions: payload.mentions });
+        if (undoStack.length > MAX_HISTORY_STACK) undoStack.shift();
+        redoStack = [];
+        writeEditorText(currentComposer.editor, res.enhancedText, payload.mentions);
         renderPill();
         const sec = ((res.elapsedMs || 0) / 1000).toFixed(1);
         showToast(`✨ 已由 ${res.modelLabel || currentModelShortLabel()} 增强 (${sec}s)`);
@@ -545,16 +732,39 @@ module.exports = function installPromptEnhancerWidget() {
     } catch (e) {
       if (reqId !== activeReqId) return;
       busy = false;
+      activeReqKey = null;
       renderPill();
       showToast(`⚠️ 优化失败: ${e.message || '请重试'}`, 3500);
     }
   }
 
-  function clearUndoState() {
-    if (undoText === null && redoText === null) return;
-    undoText = null;
-    redoText = null;
+  function clearHistoryStacks() {
+    if (!undoStack.length && !redoStack.length) return;
+    undoStack = [];
+    redoStack = [];
     renderPill();
+  }
+
+  function bindEditorListener(editor) {
+    if (unregisterLexListener) {
+      try { unregisterLexListener(); } catch {}
+      unregisterLexListener = null;
+    }
+    const lex = editor?.__lexicalEditor;
+    if (lex && typeof lex.registerUpdateListener === 'function') {
+      unregisterLexListener = lex.registerUpdateListener(({ editorState }) => {
+        if (isPluginMutating || busy) return;
+        if (!undoStack.length && !redoStack.length) return;
+        try {
+          let empty = false;
+          editorState.read(() => {
+            const root = editorState._nodeMap?.get('root');
+            if (!root || !root.getTextContent().trim()) empty = true;
+          });
+          if (empty) clearHistoryStacks();
+        } catch {}
+      });
+    }
   }
 
   function syncUndoState() {
@@ -564,31 +774,42 @@ module.exports = function installPromptEnhancerWidget() {
     if (!editor || editorChanged || pathChanged) {
       lastEditor = editor;
       lastPathname = location.pathname;
-      clearUndoState();
+      bindEditorListener(editor);
+      clearHistoryStacks();
       return;
     }
-    if (undoText !== null && !busy) {
-      const current = readEditorText(editor).trim();
-      if (!current) {
-        clearUndoState();
-      }
+    if ((undoStack.length || redoStack.length) && !busy && !isPluginMutating) {
+      if (!readEditorText(editor).trim()) clearHistoryStacks();
     }
   }
 
   function runUndo() {
-    if (!undoText || !currentComposer?.editor) return;
-    const current = readEditorText(currentComposer.editor);
-    writeEditorText(currentComposer.editor, undoText);
-    redoText = current;
-    undoText = null;
+    if (!undoStack.length || !currentComposer?.editor) return;
+    const currentSnap = extractComposerPayload(currentComposer.editor);
+    const prevSnap = undoStack.pop();
+    redoStack.push(currentSnap);
+    if (redoStack.length > MAX_HISTORY_STACK) redoStack.shift();
+    restoreSnapshot(currentComposer.editor, prevSnap);
     renderPill();
     showToast('↩ 已恢复优化前的原始提示词');
+  }
+
+  function runRedo() {
+    if (!redoStack.length || !currentComposer?.editor) return;
+    const currentSnap = extractComposerPayload(currentComposer.editor);
+    const nextSnap = redoStack.pop();
+    undoStack.push(currentSnap);
+    if (undoStack.length > MAX_HISTORY_STACK) undoStack.shift();
+    restoreSnapshot(currentComposer.editor, nextSnap);
+    renderPill();
+    showToast('↪ 已重新应用增强后的提示词');
   }
 
   function mountWidget() {
     const found = findTargetComposer();
     if (!found) {
       if (hostNode) {
+        resizeObserver?.disconnect();
         hostNode.remove();
         hostNode = null;
         shadow = null;
@@ -603,6 +824,7 @@ module.exports = function installPromptEnhancerWidget() {
     }
     if (hostNode && hostNode.isConnected && hostNode.previousElementSibling === found.modelWrap) {
       hostNode.dataset.theme = detectTheme();
+      updateDensity();
       syncUndoState();
       return;
     }
@@ -617,17 +839,18 @@ module.exports = function installPromptEnhancerWidget() {
           <span class="sep-dot" aria-hidden="true"></span>
           <button type="button" class="btn-model" id="pe-btn-model" aria-haspopup="listbox"></button>
         </div>
-        <button type="button" class="btn-undo" id="pe-btn-undo" hidden>${UNDO_SVG}<span>还原</span></button>
+        <button type="button" class="btn-undo" id="pe-btn-undo" hidden>${UNDO_SVG}<span class="undo-label">还原</span></button>
+        <button type="button" class="btn-redo" id="pe-btn-redo" hidden>${REDO_SVG}</button>
         <div class="toast" id="pe-toast" hidden></div>
         <section class="popover-card" id="pe-popover" hidden>
           <div class="sec-title"><span>✨ 提示词增强模式</span></div>
           <div class="mode-grid" id="pe-mode-grid"></div>
           <div class="custom-box" id="pe-custom-box" hidden>
-            <textarea id="pe-custom-input" placeholder="输入自定义优化要求（例如：突出安全审计要求、输出分点需求文档…）"></textarea>
+            <textarea id="pe-custom-input" placeholder="输入自定义优化要求（自动防抖保存）…"></textarea>
           </div>
           <div class="sec-title"><span>🤖 选择优化所用大模型</span></div>
           <div class="model-list" id="pe-model-list" role="listbox"></div>
-          <div class="foot-tip"><span>快捷键: Alt + E 立即增强</span><span>点 ↩ 一键还原</span></div>
+          <div class="foot-tip"><span>快捷键: Alt + E 增强</span><span>↩/↪ 对比还原</span></div>
         </section>
       `;
       const popover = shadow.getElementById('pe-popover');
@@ -640,15 +863,31 @@ module.exports = function installPromptEnhancerWidget() {
       shadow.getElementById('pe-btn-enhance').addEventListener('click', () => void runEnhance());
       shadow.getElementById('pe-btn-model').addEventListener('click', () => togglePopover());
       shadow.getElementById('pe-btn-undo').addEventListener('click', () => runUndo());
+      shadow.getElementById('pe-btn-redo').addEventListener('click', () => runRedo());
       const customInput = shadow.getElementById('pe-custom-input');
       customInput.addEventListener('input', () => {
         state.customSystemPrompt = customInput.value;
-        saveLocalState();
+        clearTimeout(saveCustomTimer);
+        saveCustomTimer = setTimeout(saveLocalState, 300);
       });
     }
     found.modelWrap.after(hostNode);
+    resizeObserver?.disconnect();
+    resizeObserver = new ResizeObserver(() => {
+      updateDensity();
+      if (menuOpen) positionPopover();
+    });
+    resizeObserver.observe(found.footer);
     syncUndoState();
     renderPill();
+  }
+
+  function scheduleMount() {
+    if (mountRaf !== null) return;
+    mountRaf = requestAnimationFrame(() => {
+      mountRaf = null;
+      mountWidget();
+    });
   }
 
   const scheduleUndoSync = () => {
@@ -660,7 +899,7 @@ module.exports = function installPromptEnhancerWidget() {
     if (menuOpen && hostNode && !e.composedPath().includes(hostNode)) {
       togglePopover(false);
     }
-    if (undoText !== null && currentComposer?.box && e.composedPath().includes(currentComposer.box)) {
+    if ((undoStack.length || redoStack.length) && currentComposer?.box && e.composedPath().includes(currentComposer.box)) {
       const btn = e.target?.closest?.('button, [role="button"]');
       if (btn && btn.closest?.('[data-testid="agent-input-box"]') === currentComposer.box) {
         scheduleUndoSync();
@@ -675,46 +914,41 @@ module.exports = function installPromptEnhancerWidget() {
       }
     } else if (e.key === 'Escape' && menuOpen) {
       togglePopover(false);
-    } else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && undoText !== null) {
+    } else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && (undoStack.length || redoStack.length)) {
       if (currentComposer?.editor && e.composedPath().includes(currentComposer.editor)) {
         scheduleUndoSync();
       }
     }
   };
-  const onEditorInput = () => {
-    if (undoText !== null) syncUndoState();
+  const onWindowResize = () => {
+    updateDensity();
+    if (menuOpen) positionPopover();
   };
+
   document.addEventListener('pointerdown', onDocClick, true);
   document.addEventListener('keydown', onKeyDown, true);
-  document.addEventListener('input', onEditorInput, true);
-  document.addEventListener('keyup', onEditorInput, true);
-
-  async function syncBackendInit() {
-    try {
-      const init = await window.agPromptEnhancerHost.init();
-      if (init?.models?.length) state.models = init.models;
-      if (init?.prefs) {
-        if (init.prefs.selectedModel) state.selectedModel = init.prefs.selectedModel;
-        if (init.prefs.selectedMode) state.selectedMode = init.prefs.selectedMode;
-        if (typeof init.prefs.customSystemPrompt === 'string') state.customSystemPrompt = init.prefs.customSystemPrompt;
-      }
-      renderPill();
-    } catch {}
-  }
+  window.addEventListener('resize', onWindowResize);
 
   mountWidget();
-  void syncBackendInit();
-  const timer = setInterval(mountWidget, 800);
-  const obs = new MutationObserver(() => mountWidget());
+  window.agPromptEnhancerHost.init().then(applyBackendState).catch(() => {});
+  const timer = setInterval(scheduleMount, 1500);
+  const obs = new MutationObserver(scheduleMount);
   obs.observe(document.body || document.documentElement, { childList: true, subtree: true });
 
   window.__agPromptEnhancerDispose = () => {
+    if (mountRaf !== null) cancelAnimationFrame(mountRaf);
     clearInterval(timer);
+    clearTimeout(toastTimer);
+    clearTimeout(saveCustomTimer);
     obs.disconnect();
+    resizeObserver?.disconnect();
+    if (unregisterLexListener) {
+      try { unregisterLexListener(); } catch {}
+      unregisterLexListener = null;
+    }
     document.removeEventListener('pointerdown', onDocClick, true);
     document.removeEventListener('keydown', onKeyDown, true);
-    document.removeEventListener('input', onEditorInput, true);
-    document.removeEventListener('keyup', onEditorInput, true);
+    window.removeEventListener('resize', onWindowResize);
     hostNode?.remove();
     hostNode = null;
     shadow = null;

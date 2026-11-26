@@ -2,7 +2,7 @@
   "name": "prompt-enhancer",
   "displayName": "提示词增强器 (Prompt Enhancer)",
   "description": "在聊天输入框模型选择器旁内嵌一键提示词增强按钮，支持自由选择优化模型与增强风格，一键改写并回填高质量提示词。",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "repository": "https://github.com/makisekurse/antigravity-prompt-enhancer",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

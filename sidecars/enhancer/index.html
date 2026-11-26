@@ -8,80 +8,247 @@
     :root {
       color-scheme: light dark;
       --bg: #f8fafc; --card: #ffffff; --fg: #1e293b; --muted: #64748b;
-      --border: #e2e8f0; --accent: #4f46e5; --accent-bg: rgba(79,70,229,0.1);
+      --border: #e2e8f0; --accent: #3f3f46; --accent-hover: #27272a;
+      --soft: rgba(15, 23, 42, 0.05); --danger: #dc2626; --danger-bg: rgba(220, 38, 38, 0.09);
     }
     @media (prefers-color-scheme: dark) {
       :root {
         --bg: #141619; --card: #1e2024; --fg: #e2e8f0; --muted: #94a3b8;
-        --border: #333740; --accent: #818cf8; --accent-bg: rgba(129,140,248,0.16);
+        --border: #333740; --accent: #e4e4e7; --accent-hover: #ffffff;
+        --soft: rgba(255, 255, 255, 0.06); --danger: #f87171; --danger-bg: rgba(248, 113, 113, 0.14);
       }
     }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 16px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--fg); font-size: 13px; }
-    h2 { margin: 0 0 6px; font-size: 16px; display: flex; align-items: center; gap: 6px; }
-    p.sub { margin: 0 0 14px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    body { margin: 0; padding: 14px; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--fg); font-size: 13px; }
+    h2 { margin: 0 0 4px; font-size: 15px; display: flex; align-items: center; gap: 6px; }
+    p.sub { margin: 0 0 12px; color: var(--muted); font-size: 12px; line-height: 1.5; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
-    label { display: block; font-size: 11.5px; font-weight: 600; color: var(--muted); margin-bottom: 6px; }
-    select, textarea { width: 100%; padding: 8px; border-radius: 7px; border: 1px solid var(--border); background: transparent; color: var(--fg); font: inherit; margin-bottom: 10px; }
-    textarea { min-height: 80px; resize: vertical; }
-    button.primary { width: 100%; padding: 8px 12px; border: 0; border-radius: 7px; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
-    .hist-item { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 8px; font-size: 12px; }
-    .hist-meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
-    .hist-text { white-space: pre-wrap; background: var(--accent-bg); padding: 6px 8px; border-radius: 6px; font-size: 11.5px; }
+    .row-between { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+    label { display: block; font-size: 11.5px; font-weight: 600; color: var(--muted); margin-bottom: 5px; }
+    select, textarea { width: 100%; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--border); background: transparent; color: var(--fg); font: inherit; font-size: 12px; margin-bottom: 10px; outline: none; }
+    select:focus, textarea:focus { border-color: var(--accent); }
+    textarea { min-height: 76px; resize: vertical; }
+    button { font: inherit; cursor: pointer; border-radius: 7px; transition: opacity 0.15s, background-color 0.15s; }
+    button.primary { width: 100%; padding: 8px 12px; border: 0; background: var(--accent); color: var(--bg); font-weight: 600; font-size: 12.5px; }
+    button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+    button.primary:disabled { opacity: 0.6; cursor: wait; }
+    button.ghost { padding: 3px 8px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; }
+    button.ghost:hover { background: var(--soft); color: var(--fg); }
+    .err-bar { display: none; margin-top: 8px; padding: 7px 10px; border-radius: 7px; background: var(--danger-bg); color: var(--danger); font-size: 12px; }
+    .save-tip { font-size: 11px; color: var(--muted); }
+    .hist-item { border-top: 1px solid var(--border); padding-top: 9px; margin-top: 9px; font-size: 12px; }
+    .hist-item:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+    .hist-meta { display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+    .hist-orig { color: var(--muted); font-size: 11.5px; margin-bottom: 5px; white-space: pre-wrap; border-left: 2px solid var(--border); padding-left: 7px; }
+    .hist-text { white-space: pre-wrap; background: var(--soft); padding: 7px 9px; border-radius: 7px; font-size: 12px; line-height: 1.5; }
+    .empty-note { color: var(--muted); font-size: 12px; }
   </style>
 </head>
 <body>
-  <h2>✨ 提示词增强器</h2>
-  <p class="sub">内嵌按钮已自动挂载在聊天输入框底部「模型选择」按钮右侧。您也可以在此面板直接测试或查看最近优化历史。</p>
+  <h2>✨ 提示词增强器 <span style="font-size:11px;font-weight:400;color:var(--muted);">v1.1</span></h2>
+  <p class="sub">内嵌按钮已自动挂载在输入框「模型选择」右侧，修改下方配置会实时同步至内嵌按钮。</p>
+
   <div class="card">
-    <label for="model-sel">默认优化模型</label>
+    <div class="row-between">
+      <label for="model-sel" style="margin:0;">默认优化模型</label>
+      <span class="save-tip" id="save-tip"></span>
+    </div>
     <select id="model-sel"></select>
+
     <label for="mode-sel">优化风格模式</label>
     <select id="mode-sel"></select>
-    <label for="test-in">测试提示词</label>
+
+    <div id="custom-wrap" style="display:none;">
+      <label for="custom-rule">自定义优化指令</label>
+      <textarea id="custom-rule" style="min-height:60px;" placeholder="填写专属优化规则（自动保存）…"></textarea>
+    </div>
+
+    <label for="test-in">在线测试提示词</label>
     <textarea id="test-in" placeholder="输入原始提示词进行增强测试…"></textarea>
     <button class="primary" id="btn-run">✨ 立即优化测试</button>
+    <div class="err-bar" id="err-bar"></div>
     <div id="test-out-wrap" style="display:none;margin-top:10px;">
-      <label>优化结果</label>
+      <div class="row-between">
+        <label style="margin:0;">优化结果</label>
+        <button type="button" class="ghost" id="btn-copy-out">复制</button>
+      </div>
       <div class="hist-text" id="test-out"></div>
     </div>
   </div>
+
   <div class="card">
-    <label>最近优化记录</label>
-    <div id="hist-list"><span style="color:var(--muted);font-size:12px;">暂无历史记录</span></div>
+    <div class="row-between">
+      <label style="margin:0;">最近优化记录</label>
+      <button type="button" class="ghost" id="btn-clear-hist">清空记录</button>
+    </div>
+    <div id="hist-list"><span class="empty-note">暂无历史记录</span></div>
   </div>
+
   <script>
-    async function loadState() {
-      const res = await fetch('/api/state').then(r => r.json());
-      const ms = document.getElementById('model-sel');
-      ms.innerHTML = (res.models || []).map(m => `<option value="${m.id}" ${m.id === res.prefs?.selectedModel ? 'selected' : ''}>${m.label}</option>`).join('');
-      const mds = document.getElementById('mode-sel');
-      mds.innerHTML = (res.modes || []).map(m => `<option value="${m.id}" ${m.id === res.prefs?.selectedMode ? 'selected' : ''}>${m.label}</option>`).join('');
-      const hist = res.prefs?.history || [];
-      if (hist.length) {
-        document.getElementById('hist-list').innerHTML = hist.slice(0, 6).map(h => `
-          <div class="hist-item">
-            <div class="hist-meta">${h.modelLabel} · ${(h.elapsedMs/1000).toFixed(1)}s</div>
-            <div class="hist-text">${h.enhanced.replace(/</g,'&lt;')}</div>
-          </div>`).join('');
+    const $ = id => document.getElementById(id);
+    let saveTimer = null;
+
+    function flashTip(text) {
+      $('save-tip').textContent = text;
+      setTimeout(() => { if ($('save-tip').textContent === text) $('save-tip').textContent = ''; }, 1800);
+    }
+
+    function showError(msg) {
+      const el = $('err-bar');
+      if (!msg) { el.style.display = 'none'; el.textContent = ''; return; }
+      el.textContent = '⚠️ ' + msg;
+      el.style.display = 'block';
+    }
+
+    async function persistPrefs(patch) {
+      try {
+        await fetch('/api/prefs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        flashTip('已自动保存');
+      } catch {
+        flashTip('保存失败');
       }
     }
-    document.getElementById('btn-run').addEventListener('click', async () => {
-      const btn = document.getElementById('btn-run');
-      const text = document.getElementById('test-in').value.trim();
+
+    function renderHistory(hist) {
+      const list = $('hist-list');
+      list.replaceChildren();
+      if (!hist || !hist.length) {
+        const span = document.createElement('span');
+        span.className = 'empty-note';
+        span.textContent = '暂无历史记录';
+        list.append(span);
+        return;
+      }
+      for (const h of hist.slice(0, 10)) {
+        const item = document.createElement('div');
+        item.className = 'hist-item';
+
+        const meta = document.createElement('div');
+        meta.className = 'hist-meta';
+        const info = document.createElement('span');
+        const sec = ((h.elapsedMs || 0) / 1000).toFixed(1);
+        info.textContent = `${h.modelLabel || '模型'} · ${sec}s`;
+        const copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.className = 'ghost';
+        copyBtn.textContent = '复制';
+        copyBtn.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(h.enhanced || '');
+            copyBtn.textContent = '已复制';
+            setTimeout(() => { copyBtn.textContent = '复制'; }, 1200);
+          } catch {}
+        });
+        meta.append(info, copyBtn);
+
+        if (h.original) {
+          const orig = document.createElement('div');
+          orig.className = 'hist-orig';
+          orig.textContent = '原稿：' + h.original;
+          item.append(meta, orig);
+        } else {
+          item.append(meta);
+        }
+
+        const body = document.createElement('div');
+        body.className = 'hist-text';
+        body.textContent = h.enhanced || '';
+        item.append(body);
+        list.append(item);
+      }
+    }
+
+    function syncCustomVisibility() {
+      $('custom-wrap').style.display = $('mode-sel').value === 'custom' ? 'block' : 'none';
+    }
+
+    async function loadState() {
+      try {
+        const res = await fetch('/api/state').then(r => r.json());
+        const ms = $('model-sel');
+        ms.replaceChildren();
+        for (const m of (res.models || [])) {
+          const opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.label;
+          if (m.id === res.prefs?.selectedModel) opt.selected = true;
+          ms.append(opt);
+        }
+        const mds = $('mode-sel');
+        mds.replaceChildren();
+        for (const m of (res.modes || [])) {
+          const opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.label;
+          if (m.id === res.prefs?.selectedMode) opt.selected = true;
+          mds.append(opt);
+        }
+        $('custom-rule').value = res.prefs?.customSystemPrompt || '';
+        syncCustomVisibility();
+        renderHistory(res.prefs?.history || []);
+      } catch (e) {
+        showError('加载插件配置失败，请确认后台服务正在运行');
+      }
+    }
+
+    $('model-sel').addEventListener('change', () => {
+      void persistPrefs({ selectedModel: $('model-sel').value });
+    });
+    $('mode-sel').addEventListener('change', () => {
+      syncCustomVisibility();
+      void persistPrefs({ selectedMode: $('mode-sel').value });
+    });
+    $('custom-rule').addEventListener('input', () => {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        void persistPrefs({ customSystemPrompt: $('custom-rule').value });
+      }, 300);
+    });
+    $('btn-copy-out').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText($('test-out').textContent || '');
+        $('btn-copy-out').textContent = '已复制';
+        setTimeout(() => { $('btn-copy-out').textContent = '复制'; }, 1200);
+      } catch {}
+    });
+    $('btn-clear-hist').addEventListener('click', async () => {
+      await fetch('/api/history/clear', { method: 'POST' });
+      renderHistory([]);
+      flashTip('历史已清空');
+    });
+    $('btn-run').addEventListener('click', async () => {
+      const btn = $('btn-run');
+      const text = $('test-in').value.trim();
       if (!text) return;
+      showError('');
       btn.disabled = true; btn.textContent = '⏳ 正在优化…';
       try {
         const res = await fetch('/api/enhance', {
-          method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ text, model: document.getElementById('model-sel').value, mode: document.getElementById('mode-sel').value })
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text,
+            model: $('model-sel').value,
+            mode: $('mode-sel').value,
+            customSystemPrompt: $('custom-rule').value,
+          }),
         }).then(r => r.json());
-        if (res.enhancedText) {
-          document.getElementById('test-out-wrap').style.display = 'block';
-          document.getElementById('test-out').textContent = res.enhancedText;
-          loadState();
+        if (res.error) {
+          showError(res.error);
+        } else if (res.enhancedText) {
+          $('test-out-wrap').style.display = 'block';
+          $('test-out').textContent = res.enhancedText;
+          await loadState();
         }
-      } finally { btn.disabled = false; btn.textContent = '✨ 立即优化测试'; }
+      } catch (e) {
+        showError(e.message || '请求失败');
+      } finally {
+        btn.disabled = false; btn.textContent = '✨ 立即优化测试';
+      }
     });
     loadState();
   </script>
